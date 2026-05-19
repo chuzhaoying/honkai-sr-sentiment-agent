@@ -19,9 +19,11 @@ import time
 import glob
 import subprocess
 import sys
+import random
 from datetime import datetime, timedelta, date
 
 import pandas as pd
+import requests
 import streamlit as st
 
 # ─────────────────────────────────────────
@@ -40,6 +42,142 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 MIYOUSHE_DIR = os.path.join(BASE_DIR, "miyoushe")
 # 检测是否在云端运行（CloudRun 会设置 PORT 环境变量）
 IS_CLOUD = os.environ.get("PORT") is not None
+
+# ─────────────────────────────────────────
+# 米游社 API 采集（内置，云端也可用）
+# ─────────────────────────────────────────
+MIYOUSHE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Referer": "https://www.miyoushe.com/sr/home/52",
+    "Origin": "https://www.miyoushe.com",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+}
+
+
+def _extract_text(content_raw):
+    """清理正文：去除 HTML 标签"""
+    if not content_raw:
+        return ""
+    return re.sub(r'<[^>]+>', '', str(content_raw)).strip()
+
+
+def fetch_latest_posts(pages_per_sort=5):
+    """从米游社 API 实时拉取最新帖子（热门+最新发布+最新回复）"""
+    all_posts = []
+    gids, forum_id, page_size = 6, 52, 20
+    sort_modes = {2: "热门", 1: "最新发布", 3: "最新回复"}
+
+    for sort_type, sort_name in sort_modes.items():
+        last_id = None
+        for _ in range(pages_per_sort):
+            try:
+                params = {"forum_id": forum_id, "gids": gids,
+                          "page_size": page_size, "sort_type": sort_type}
+                if last_id:
+                    params["last_id"] = last_id
+                r = requests.get(
+                    "https://bbs-api.miyoushe.com/post/wapi/getForumPostList",
+                    headers=MIYOUSHE_HEADERS, params=params, timeout=15)
+                data = r.json()
+                if data.get("retcode") != 0:
+                    break
+                post_list = data["data"]["list"]
+                if not post_list:
+                    break
+                for item in post_list:
+                    post = item.get("post", {})
+                    user = item.get("user", {})
+                    stat = item.get("stat", {})
+                    all_posts.append({
+                        "帖子ID": post.get("post_id", ""),
+                        "标题": post.get("subject", ""),
+                        "正文": _extract_text(post.get("content", ""))[:3000],
+                        "作者": user.get("nickname", ""),
+                        "发布时间": time.strftime("%Y-%m-%d %H:%M:%S",
+                                                   time.localtime(post.get("created_at", 0))),
+                        "点赞数": stat.get("like_num", 0),
+                        "评论数": stat.get("reply_num", 0),
+                        "浏览数": stat.get("view_num", 0),
+                        "排序方式": sort_name,
+                    })
+                last_id = data["data"].get("last_id")
+                if not last_id:
+                    break
+                time.sleep(0.5 + random.random() * 1.5)
+            except Exception:
+                break
+
+    if all_posts:
+        df = pd.DataFrame(all_posts)
+        df = df.drop_duplicates(subset=["帖子ID"], keep="first")
+        return df
+    return pd.DataFrame()
+
+
+def fetch_post_comments(post_id, max_comments=30):
+    """拉取单篇帖子的评论"""
+    comments = []
+    last_id = None
+    headers = MIYOUSHE_HEADERS.copy()
+    headers["Referer"] = f"https://www.miyoushe.com/sr/article/{post_id}"
+    try:
+        while True:
+            params = {"post_id": post_id, "gids": 6,
+                      "page_size": min(max_comments, 50), "order_type": 2}
+            if last_id:
+                params["last_id"] = last_id
+            r = requests.get(
+                "https://bbs-api.miyoushe.com/post/wapi/getPostReplies",
+                headers=headers, params=params, timeout=10)
+            data = r.json()
+            if data.get("retcode") != 0:
+                break
+            reply_list = data["data"].get("list", [])
+            if not reply_list:
+                break
+            for item in reply_list:
+                reply = item.get("reply", {})
+                user = item.get("user", {})
+                stat = item.get("stat", {})
+                raw = reply.get("content", "")
+                clean = clean_comment(raw)
+                if not clean:
+                    continue
+                comments.append({
+                    "帖子ID": post_id,
+                    "评论ID": reply.get("reply_id", ""),
+                    "评论内容": clean,
+                    "评论者": user.get("nickname", ""),
+                    "评论时间": time.strftime("%Y-%m-%d %H:%M:%S",
+                                               time.localtime(reply.get("created_at", 0))),
+                    "点赞数": stat.get("like_num", 0),
+                })
+            if data["data"].get("is_last", True):
+                break
+            last_id = data["data"].get("last_id")
+            if not last_id:
+                break
+            time.sleep(0.3 + random.random())
+    except Exception:
+        pass
+    return comments
+
+
+def fetch_latest_comments(posts_df, max_posts=30, max_per_post=20):
+    """从最新帖子中采集评论"""
+    if posts_df.empty:
+        return pd.DataFrame()
+    target = posts_df[posts_df["评论数"] >= 1].nlargest(max_posts, "评论数")
+    all_comments = []
+    for _, row in target.iterrows():
+        cmts = fetch_post_comments(str(row["帖子ID"]), max_per_post)
+        all_comments.extend(cmts)
+        time.sleep(0.3 + random.random())
+    if all_comments:
+        return pd.DataFrame(all_comments)
+    return pd.DataFrame()
+
 
 # ─────────────────────────────────────────
 # 分类体系（基于崩铁社区实际话题）
@@ -166,7 +304,6 @@ def clean_comment(raw_content):
         if end_idx == -1:
             break
         text = text[:idx] + text[end_idx + 1:]
-    import re
     text = re.sub(r"<[^>]+>", "", text)
     text = " ".join(text.split())
     return text.strip() if len(text.strip()) >= 2 else ""
@@ -175,9 +312,9 @@ def clean_comment(raw_content):
 # ─────────────────────────────────────────
 # 数据加载
 # ─────────────────────────────────────────
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=600)
 def load_all_data():
-    """加载 data/ 下所有 xlsx"""
+    """加载 data/ 下所有 xlsx + 实时采集最新帖子"""
     result = {}
     os.makedirs(DATA_DIR, exist_ok=True)
     xlsx_files = glob.glob(os.path.join(DATA_DIR, "*.xlsx"))
@@ -187,10 +324,25 @@ def load_all_data():
             result[name] = pd.read_excel(path)
         except Exception:
             result[name] = pd.DataFrame()
+
+    # 实时拉取最新帖子（合并到本地数据）
+    try:
+        live_posts = fetch_latest_posts(pages_per_sort=5)
+        if not live_posts.empty:
+            # 与本地帖子合并去重
+            if "miyoushe_posts" in result and not result["miyoushe_posts"].empty:
+                combined = pd.concat([result["miyoushe_posts"], live_posts], ignore_index=True)
+                combined = combined.drop_duplicates(subset=["帖子ID"], keep="first")
+                result["miyoushe_posts"] = combined
+            else:
+                result["miyoushe_posts"] = live_posts
+    except Exception:
+        pass
+
     return result
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=600)
 def build_analysis_df(raw):
     """构建带分类和情感标注的统一分析表"""
     rows = []
@@ -341,7 +493,6 @@ def generate_report(df, keywords, start_date, end_date):
     neg_pct = neg / total * 100
 
     category_counts = df["分类"].value_counts()
-    cat_sentiment = {}
 
     lines = [
         f"# 🚂 崩坏星穹铁道 · 玩家舆情分析报告",
@@ -440,7 +591,7 @@ def generate_report(df, keywords, start_date, end_date):
 
 
 # ─────────────────────────────────────────
-# 一键采集按钮
+# 一键采集按钮（仅本地模式）
 # ─────────────────────────────────────────
 def run_collector():
     """在后台运行采集脚本"""
@@ -470,6 +621,61 @@ def run_comment_collector():
         )
         return proc
     return None
+
+
+# ─────────────────────────────────────────
+# 纯规则问答
+# ─────────────────────────────────────────
+def rule_answer(question, df):
+    total = len(df)
+    pos = (df["情感"] == "positive").sum()
+    neg = (df["情感"] == "negative").sum()
+    cat_counts = df["分类"].value_counts()
+    q = question.lower()
+
+    if any(w in q for w in ["负面", "差评", "问题", "吐槽"]):
+        top_neg = df[df["情感"] == "negative"].nlargest(5, "点赞数")
+        if top_neg.empty:
+            return "✅ 当前范围内没有明显负面声音！"
+        lines = ["🔴 **负面热点 TOP 5：**\n"]
+        for i, (_, r) in enumerate(top_neg.iterrows(), 1):
+            snippet = str(r["内容"])[:80]
+            lines.append(f"{i}. [{r['分类']}] {snippet}… (👍{int(r['点赞数'])})")
+        neg_cat = df[df["情感"] == "negative"]["分类"].value_counts().index[0] if not df[df["情感"] == "negative"].empty else "无"
+        lines.append(f"\n📌 负面最集中在**「{neg_cat}」**，占比 {neg/total*100:.0f}%。")
+        return "\n".join(lines)
+
+    elif any(w in q for w in ["话题", "讨论", "分类", "热点"]):
+        lines = ["📈 **玩家当前最关注的话题：**\n"]
+        for cat, cnt in cat_counts.items():
+            pct = cnt / total * 100
+            lines.append(f"- **{cat}**：{cnt} 条 ({pct:.0f}%)")
+        return "\n".join(lines)
+
+    elif any(w in q for w in ["简报", "总结", "概况"]):
+        neg_cat = df[df["情感"] == "negative"]["分类"].value_counts().index[0] if not df[df["情感"] == "negative"].empty else "无"
+        return f"""📊 **舆情简报**
+
+- 当前共 **{total}** 条（帖子 {len(df[df['类型']=='帖子'])} + 评论 {len(df[df['类型']=='评论'])}）
+- 情感分布：正面 {pos/total*100:.0f}% / 负面 {neg/total*100:.0f}% / 中性 {(total-pos-neg)/total*100:.0f}%
+- 最热分类：**{cat_counts.index[0]}**（{cat_counts.iloc[0]} 条）
+- 负面集中在：**{neg_cat}**
+- {'🔴 需重点关注' if neg/total >= 0.3 else '🟢 整体健康'}"""
+
+    elif any(w in q for w in ["运营", "建议", "怎么做"]):
+        lines = ["💡 **运营建议：**\n"]
+        neg_cat = df[df["情感"] == "negative"]["分类"].value_counts().index[0] if not df[df["情感"] == "negative"].empty else None
+        if neg_cat:
+            lines.append(f"1. 「{neg_cat}」负面声音最多，建议专项回应")
+        if "🐛 技术问题" in cat_counts and cat_counts.get("🐛 技术问题", 0) >= 3:
+            lines.append("2. BUG/卡顿反馈较多，建议优先修复")
+        lines.append("3. 定期运行报告追踪舆情变化")
+        return "\n".join(lines)
+
+    else:
+        return f"""📊 当前数据（共 {total} 条）：
+- 正面：{pos}（{pos/total*100:.0f}%）/ 负面：{neg}（{neg/total*100:.0f}%）
+- 最热分类：{cat_counts.index[0] if len(cat_counts) > 0 else '暂无'}"""
 
 
 # ─────────────────────────────────────────
@@ -564,19 +770,16 @@ def main():
                 else:
                     st.spinner(f"评论采集中... ({elapsed:.0f}s)")
             st.markdown("---")
-        else:
-            st.info("☁️ 云端模式：数据已内置，无需采集")
-            st.markdown("---")
 
         if st.button("🔄 刷新数据", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
 
-        st.caption(f"📂 数据目录：`{DATA_DIR}`")
+        st.caption("🌐 数据自动从米游社实时获取")
 
-    # ── 主区域 ─────────────────────────────
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📊 概览与报告", "🏷️ 分类浏览", "📋 数据明细", "💬 对话问答", "📁 数据状态"
+    # ── 主区域（4个Tab） ─────────────────
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📊 概览与报告", "🏷️ 分类浏览", "📋 数据明细", "💬 对话问答"
     ])
 
     # 加载数据
@@ -589,7 +792,7 @@ def main():
         st.markdown(f"### 📊 舆情概览  `{start_date} ～ {end_date}`")
 
         if filtered_df.empty:
-            st.warning("⚠️ 没有数据。请先点击左侧「📥 采集帖子」按钮采集数据。")
+            st.warning("⚠️ 所选时间范围内没有数据，请尝试扩大时间范围。")
         else:
             total = len(filtered_df)
             posts = len(filtered_df[filtered_df["类型"] == "帖子"])
@@ -718,7 +921,7 @@ def main():
 
             show_cols = ["时间", "类型", "标题", "内容", "分类", "情感", "点赞数", "评论数", "作者"]
             available = [c for c in show_cols if c in display.columns]
-            styled = display[available].style.applymap(color_row, subset=["情感"])
+            styled = display[available].style.map(color_row, subset=["情感"])
             st.dataframe(styled, use_container_width=True, height=600)
 
             csv = display[available].to_csv(index=False, encoding="utf-8-sig")
@@ -729,7 +932,7 @@ def main():
     with tab4:
         st.markdown("### 💬 舆情对话问答")
         if filtered_df.empty:
-            st.warning("请先采集数据。")
+            st.warning("暂无数据，请先选择有时间范围的数据。")
         else:
             if "messages" not in st.session_state:
                 st.session_state.messages = []
@@ -760,104 +963,6 @@ def main():
                 if st.button("🗑️ 清空对话"):
                     st.session_state.messages = []
                     st.rerun()
-
-    # ─────────── TAB 5：数据状态 ───────────
-    with tab5:
-        st.markdown("### 📁 数据文件状态")
-        if IS_CLOUD:
-            st.info("☁️ **云端模式**：数据文件已内置在镜像中，无需手动采集。")
-        xlsx_files = glob.glob(os.path.join(DATA_DIR, "*.xlsx"))
-        if not xlsx_files:
-            if not IS_CLOUD:
-                st.warning("data/ 目录下没有数据文件。请点击左侧「📥 采集帖子」。")
-            else:
-                st.warning("内置数据文件未找到，请联系部署者。")
-        else:
-            files_info = []
-            for path in xlsx_files:
-                name = os.path.basename(path)
-                size_kb = os.path.getsize(path) / 1024
-                mtime = datetime.fromtimestamp(os.path.getmtime(path))
-                try:
-                    df = pd.read_excel(path)
-                    files_info.append({
-                        "文件名": name, "行数": len(df), "列数": len(df.columns),
-                        "更新时间": mtime.strftime("%Y-%m-%d %H:%M"),
-                        "大小(KB)": f"{size_kb:.1f}",
-                    })
-                except Exception as e:
-                    files_info.append({"文件名": name, "行数": "错误", "列数": "-",
-                                       "更新时间": mtime.strftime("%Y-%m-%d %H:%M"),
-                                       "大小(KB)": f"{size_kb:.1f}"})
-            st.dataframe(pd.DataFrame(files_info), use_container_width=True)
-
-        st.markdown("---")
-        st.markdown("**📥 如何更新数据？**")
-        st.code("""# 方法一：在网站左侧点击按钮
-点击「📥 采集帖子」→ 自动采集板块52帖子（热门+最新发布+最新回复）
-点击「💬 采集评论」→ 自动采集所有帖子的评论
-点击「🔄 刷新数据」→ 刷新页面数据
-
-# 方法二：手动运行脚本
-cd player_sentiment/miyoushe
-python step1_get_post_list.py    # 采集帖子
-python step2_get_post_detail.py  # 采集评论
-""", language="bash")
-
-
-# ─────────────────────────────────────────
-# 纯规则问答
-# ─────────────────────────────────────────
-def rule_answer(question, df):
-    total = len(df)
-    pos = (df["情感"] == "positive").sum()
-    neg = (df["情感"] == "negative").sum()
-    cat_counts = df["分类"].value_counts()
-    q = question.lower()
-
-    if any(w in q for w in ["负面", "差评", "问题", "吐槽"]):
-        top_neg = df[df["情感"] == "negative"].nlargest(5, "点赞数")
-        if top_neg.empty:
-            return "✅ 当前范围内没有明显负面声音！"
-        lines = ["🔴 **负面热点 TOP 5：**\n"]
-        for i, (_, r) in enumerate(top_neg.iterrows(), 1):
-            snippet = str(r["内容"])[:80]
-            lines.append(f"{i}. [{r['分类']}] {snippet}… (👍{int(r['点赞数'])})")
-        neg_cat = df[df["情感"] == "negative"]["分类"].value_counts().index[0] if not df[df["情感"] == "negative"].empty else "无"
-        lines.append(f"\n📌 负面最集中在**「{neg_cat}」**，占比 {neg/total*100:.0f}%。")
-        return "\n".join(lines)
-
-    elif any(w in q for w in ["话题", "讨论", "分类", "热点"]):
-        lines = ["📈 **玩家当前最关注的话题：**\n"]
-        for cat, cnt in cat_counts.items():
-            pct = cnt / total * 100
-            lines.append(f"- **{cat}**：{cnt} 条 ({pct:.0f}%)")
-        return "\n".join(lines)
-
-    elif any(w in q for w in ["简报", "总结", "概况"]):
-        neg_cat = df[df["情感"] == "negative"]["分类"].value_counts().index[0] if not df[df["情感"] == "negative"].empty else "无"
-        return f"""📊 **舆情简报**
-
-- 当前共 **{total}** 条（帖子 {len(df[df['类型']=='帖子'])} + 评论 {len(df[df['类型']=='评论'])}）
-- 情感分布：正面 {pos/total*100:.0f}% / 负面 {neg/total*100:.0f}% / 中性 {(total-pos-neg)/total*100:.0f}%
-- 最热分类：**{cat_counts.index[0]}**（{cat_counts.iloc[0]} 条）
-- 负面集中在：**{neg_cat}**
-- {'🔴 需重点关注' if neg/total >= 0.3 else '🟢 整体健康'}"""
-
-    elif any(w in q for w in ["运营", "建议", "怎么做"]):
-        lines = ["💡 **运营建议：**\n"]
-        neg_cat = df[df["情感"] == "negative"]["分类"].value_counts().index[0] if not df[df["情感"] == "negative"].empty else None
-        if neg_cat:
-            lines.append(f"1. 「{neg_cat}」负面声音最多，建议专项回应")
-        if "🐛 技术问题" in cat_counts and cat_counts.get("🐛 技术问题", 0) >= 3:
-            lines.append("2. BUG/卡顿反馈较多，建议优先修复")
-        lines.append("3. 定期运行报告追踪舆情变化")
-        return "\n".join(lines)
-
-    else:
-        return f"""📊 当前数据（共 {total} 条）：
-- 正面：{pos}（{pos/total*100:.0f}%）/ 负面：{neg}（{neg/total*100:.0f}%）
-- 最热分类：{cat_counts.index[0] if len(cat_counts) > 0 else '暂无'}"""
 
 
 if __name__ == "__main__":
