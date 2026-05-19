@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 数据缓存（data目录需要提交，不要忽略）
+# 日志
+*.log
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 部署产物
+docx_gen/
+node_modules/
+
+# 其他
+存放采集到的数据/
+米游社采集代码/
+小红书采集代码/
+miyoushe/
+xiaohongshu/
+*.docx
