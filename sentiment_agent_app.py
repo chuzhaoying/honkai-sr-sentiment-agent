@@ -20,11 +20,21 @@ import glob
 import subprocess
 import sys
 import random
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 
 import pandas as pd
 import requests
 import streamlit as st
+
+# 北京时间（UTC+8）时区，用于统一转换米游社时间戳
+CST8 = timezone(timedelta(hours=8))
+
+def ts_to_cst8(ts):
+    """将米游社时间戳（秒）转换为北京时间字符串 YYYY-MM-DD HH:MM:SS"""
+    if not ts:
+        return ""
+    # 米游社 created_at 是 UTC+8 的 Unix 时间戳
+    return datetime.fromtimestamp(int(ts), tz=CST8).strftime("%Y-%m-%d %H:%M:%S")
 
 # ─────────────────────────────────────────
 # 页面设置
@@ -67,6 +77,7 @@ def fetch_latest_posts(pages_per_sort=5):
     all_posts = []
     gids, forum_id, page_size = 6, 52, 20
     sort_modes = {2: "热门", 1: "最新发布", 3: "最新回复"}
+    has_error = False
 
     for sort_type, sort_name in sort_modes.items():
         last_id = None
@@ -78,9 +89,11 @@ def fetch_latest_posts(pages_per_sort=5):
                     params["last_id"] = last_id
                 r = requests.get(
                     "https://bbs-api.miyoushe.com/post/wapi/getForumPostList",
-                    headers=MIYOUSHE_HEADERS, params=params, timeout=15)
+                    headers=MIYOUSHE_HEADERS, params=params, timeout=10)
+                r.raise_for_status()
                 data = r.json()
                 if data.get("retcode") != 0:
+                    has_error = True
                     break
                 post_list = data["data"]["list"]
                 if not post_list:
@@ -94,8 +107,7 @@ def fetch_latest_posts(pages_per_sort=5):
                         "标题": post.get("subject", ""),
                         "正文": _extract_text(post.get("content", ""))[:3000],
                         "作者": user.get("nickname", ""),
-                        "发布时间": time.strftime("%Y-%m-%d %H:%M:%S",
-                                                   time.localtime(post.get("created_at", 0))),
+                        "发布时间": ts_to_cst8(post.get("created_at", 0)),
                         "点赞数": stat.get("like_num", 0),
                         "评论数": stat.get("reply_num", 0),
                         "浏览数": stat.get("view_num", 0),
@@ -105,12 +117,20 @@ def fetch_latest_posts(pages_per_sort=5):
                 if not last_id:
                     break
                 time.sleep(0.5 + random.random() * 1.5)
+            except requests.exceptions.Timeout:
+                has_error = True
+                break
+            except requests.exceptions.RequestException:
+                has_error = True
+                break
             except Exception:
+                has_error = True
                 break
 
     if all_posts:
         df = pd.DataFrame(all_posts)
         df = df.drop_duplicates(subset=["帖子ID"], keep="first")
+        df["_fetch_error"] = has_error
         return df
     return pd.DataFrame()
 
@@ -149,8 +169,7 @@ def fetch_post_comments(post_id, max_comments=30):
                     "评论ID": reply.get("reply_id", ""),
                     "评论内容": clean,
                     "评论者": user.get("nickname", ""),
-                    "评论时间": time.strftime("%Y-%m-%d %H:%M:%S",
-                                               time.localtime(reply.get("created_at", 0))),
+                    "评论时间": ts_to_cst8(reply.get("created_at", 0)),
                     "点赞数": stat.get("like_num", 0),
                 })
             if data["data"].get("is_last", True):
@@ -326,9 +345,14 @@ def load_all_data():
             result[name] = pd.DataFrame()
 
     # 实时拉取最新帖子（合并到本地数据）
+    fetch_error = False
     try:
         live_posts = fetch_latest_posts(pages_per_sort=5)
         if not live_posts.empty:
+            fetch_error = live_posts.iloc[0].get("_fetch_error", False) if "_fetch_error" in live_posts.columns else False
+            # 移除内部标记列
+            if "_fetch_error" in live_posts.columns:
+                live_posts = live_posts.drop(columns=["_fetch_error"])
             # 与本地帖子合并去重
             if "miyoushe_posts" in result and not result["miyoushe_posts"].empty:
                 combined = pd.concat([result["miyoushe_posts"], live_posts], ignore_index=True)
@@ -336,9 +360,13 @@ def load_all_data():
                 result["miyoushe_posts"] = combined
             else:
                 result["miyoushe_posts"] = live_posts
+    except requests.exceptions.Timeout:
+        fetch_error = True
     except Exception:
-        pass
+        fetch_error = True
 
+    # 将 fetch_error 标记存到 result 中，供 UI 显示
+    result["_fetch_error"] = fetch_error
     return result
 
 
@@ -500,7 +528,7 @@ def generate_report(df, keywords, start_date, end_date):
         f"> **数据来源**：米游社板块52 (sr/home/52)  ",
         f"> **统计时间**：{start_date} ～ {end_date}  ",
         f"> **关键词筛选**：{keywords if keywords.strip() else '全量'}  ",
-        f"> **生成时间**：{datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"> **生成时间（北京时间）**：{datetime.now(CST8).strftime('%Y-%m-%d %H:%M')}",
         f"",
         f"---",
         f"",
@@ -688,10 +716,11 @@ def main():
         st.caption("数据来源：米游社板块52")
         st.markdown("---")
 
-        # 时间范围
+        # 时间范围（始终以北京时间为准）
         st.markdown("### 📅 时间范围")
         date_preset = st.selectbox("快速选择", ["最近7天", "最近30天", "最近3天", "全部数据", "自定义"], index=1)
-        today = date.today()
+        # 获取北京时间今天（不受服务器时区影响）
+        today = datetime.now(CST8).date()
         if date_preset == "最近3天":
             default_start = today - timedelta(days=3)
         elif date_preset == "最近7天":
@@ -784,6 +813,10 @@ def main():
 
     # 加载数据
     raw = load_all_data()
+    # 读取并在 raw 中移除内部标记
+    fetch_err = raw.pop("_fetch_error", False) if isinstance(raw, dict) else False
+    if fetch_err:
+        st.warning("⚠️ 实时数据获取超时，当前展示本地缓存数据（可能不含今日新帖）")
     analysis_df = build_analysis_df(raw)
     filtered_df = apply_filters(analysis_df, start_date, end_date, keywords, category_filter, sort_filter, type_filter)
 
